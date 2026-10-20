@@ -1,3 +1,5 @@
+<p align="center"><img src="logo/dextra.svg" width="128" alt="Dextra logo"></p>
+
 # Dextra
 
 *Dextra* is Latin for "right hand". It is a small personal command-line client for the
@@ -73,3 +75,7 @@ owner-only permissions, and Dextra talks only to Google.
 ## Authors
 
 Made by Aiken and Claude.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

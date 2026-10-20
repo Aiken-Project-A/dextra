@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="neon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2FD6C6"/>
+      <stop offset="1" stop-color="#6C5CFF"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#171833"/>
+      <stop offset="1" stop-color="#0C0D1E"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <g transform="translate(96,128) scale(0.75)">
+    <rect x="16" y="16" width="480" height="480" rx="112" fill="#12132A" stroke="#2A2C55" stroke-width="4"/>
+    <path d="M150 134 H246 A122 122 0 0 1 246 378 H150 Z" fill="none" stroke="url(#neon)" stroke-width="44" stroke-linejoin="round"/>
+    <path d="M214 198 L214 314 L314 256 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="18" stroke-linejoin="round"/>
+  </g>
+  <g font-family="Noto Sans, DejaVu Sans, sans-serif">
+    <text x="520" y="300" font-size="112" font-weight="600" fill="#FFFFFF">Dextra</text>
+    <text x="524" y="368" font-size="34" fill="#B9BCE0">The right hand on YouTube</text>
+    <text x="524" y="418" font-size="26" fill="#7E82B5">yt-dlp is the eyes, Dextra is the hand</text>
+  </g>
+</svg>
