@@ -149,6 +149,9 @@ def api(method, path, params=None, body=None):
             reason, msg = "", text[:300]
         if reason == "quotaExceeded":
             die("The daily quota is used up; it resets at midnight Pacific Time (see `dextra quota`).")
+        if reason == "manualSortRequired":
+            die("This playlist is sorted automatically (for example by date added), "
+                "so --top and --position do not apply: add the video without them.")
         die(f"YouTube: {e.code} {reason} — {msg}")
     spend(COST.get((method, path), 1))
     return json.loads(raw) if raw else {}
@@ -384,11 +387,15 @@ def cmd_plnew(a):
 
 def cmd_pladd(a):
     vid = video_id(a.video)
-    api("POST", "playlistItems", {"part": "snippet"}, {"snippet": {
-        "playlistId": a.playlist, "resourceId": {"kind": "youtube#video", "videoId": vid}}})
+    snippet = {"playlistId": a.playlist, "resourceId": {"kind": "youtube#video", "videoId": vid}}
+    position = 0 if a.top else a.position
+    if position is not None:
+        snippet["position"] = position
+    api("POST", "playlistItems", {"part": "snippet"}, {"snippet": snippet})
     title = video_title(vid)
-    log("playlist:add", a.playlist, f"{vid} {title}")
-    print(f"Added to the playlist: “{title}”")
+    log("playlist:add", a.playlist, f"{vid} {title}" + ("" if position is None else f" @{position}"))
+    where = "" if position is None else f" at position {position}"
+    print(f"Added to the playlist{where}: “{title}”")
 
 
 def cmd_plitems(a):
@@ -471,9 +478,11 @@ def main():
     s.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
     s.add_argument("--description")
     s.set_defaults(fn=cmd_plnew)
-    s = sp.add_parser("pl-add", help="add a video to a playlist")
+    s = sp.add_parser("pl-add", help="add a video to a playlist (at the end unless told otherwise)")
     s.add_argument("playlist")
     s.add_argument("video")
+    s.add_argument("--top", action="store_true", help="put it first")
+    s.add_argument("--position", type=int, help="0-based position")
     s.set_defaults(fn=cmd_pladd)
     s = sp.add_parser("pl-items", help="list the videos of a playlist")
     s.add_argument("playlist")
