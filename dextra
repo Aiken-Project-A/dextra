@@ -398,6 +398,35 @@ def cmd_pladd(a):
     print(f"Added to the playlist{where}: “{title}”")
 
 
+def cmd_plremove(a):
+    vid = video_id(a.video)
+    items = list(pages("playlistItems", {"part": "snippet", "playlistId": a.playlist,
+                                         "videoId": vid, "maxResults": 50}))
+    if not items:
+        print("This video is not in the playlist.")
+        return
+    for it in items:
+        api("DELETE", "playlistItems", {"id": it["id"]})
+        log("playlist:remove", a.playlist, f"{vid} {it['snippet'].get('title', '')}")
+        print(f"Removed from the playlist: “{it['snippet'].get('title', vid)}”")
+
+
+def cmd_plprune(a):
+    gone = {"Private video", "Deleted video"}
+    items = [it for it in pages("playlistItems", {"part": "snippet", "playlistId": a.playlist, "maxResults": 50})
+             if it["snippet"].get("title") in gone]
+    for it in items:
+        vid = it["snippet"]["resourceId"].get("videoId", "")
+        title = it["snippet"]["title"]
+        if a.dry_run:
+            print(f"would remove: {vid} ({title})")
+            continue
+        api("DELETE", "playlistItems", {"id": it["id"]})
+        log("playlist:prune", a.playlist, f"{vid} {title}")
+        print(f"Removed: {vid} ({title})")
+    print(f"— unavailable videos {'found' if a.dry_run else 'removed'}: {len(items)}", file=sys.stderr)
+
+
 def cmd_plitems(a):
     for it in pages("playlistItems", {"part": "snippet", "playlistId": a.playlist, "maxResults": 50}, a.limit):
         sn = it["snippet"]
@@ -484,6 +513,14 @@ def main():
     s.add_argument("--top", action="store_true", help="put it first")
     s.add_argument("--position", type=int, help="0-based position")
     s.set_defaults(fn=cmd_pladd)
+    s = sp.add_parser("pl-remove", help="remove a video from a playlist")
+    s.add_argument("playlist")
+    s.add_argument("video")
+    s.set_defaults(fn=cmd_plremove)
+    s = sp.add_parser("pl-prune", help="remove private and deleted videos from a playlist")
+    s.add_argument("playlist")
+    s.add_argument("--dry-run", action="store_true", help="only list them")
+    s.set_defaults(fn=cmd_plprune)
     s = sp.add_parser("pl-items", help="list the videos of a playlist")
     s.add_argument("playlist")
     s.add_argument("--limit", type=int)
