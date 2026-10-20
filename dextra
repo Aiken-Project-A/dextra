@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Dextra — a right hand on YouTube.
+
+A small personal command-line client for the YouTube Data API v3. It acts on the
+owner's own YouTube account: rate videos, post comments and replies, manage
+subscriptions and playlists. Pair it with yt-dlp for watching, reading and
+downloading: yt-dlp is the eyes, Dextra is the hand.
+
+Local files (created with owner-only permissions; tokens go only to Google):
+  ~/.config/dextra/client_secret.json  OAuth client of type "Desktop app"
+  ~/.config/dextra/token.json          OAuth tokens, created by `dextra auth`
+  ~/.local/state/dextra/actions.log    log of every action taken on the account
+  ~/.local/state/dextra/quota.json     estimate of today's API quota use
+
+Python 3.9+, standard library only. See README.md and PRIVACY.md.
+"""
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CONF = Path.home() / ".config" / "dextra"
+STATE = Path.home() / ".local" / "state" / "dextra"
+CLIENT = CONF / "client_secret.json"
+TOKEN = CONF / "token.json"
+LOG = STATE / "actions.log"
+QUOTA = STATE / "quota.json"
+SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+API = "https://www.googleapis.com/youtube/v3/"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+REVOKE_URI = "https://oauth2.googleapis.com/revoke"
+DAILY = 10000
+PT = ZoneInfo("America/Los_Angeles")  # the daily quota resets at midnight Pacific Time
+
+# Quota cost per call, from https://developers.google.com/youtube/v3/determine_quota_cost
+COST = {
+    ("GET", "channels"): 1, ("GET", "videos"): 1, ("GET", "videos/getRating"): 1,
+    ("POST", "videos/rate"): 50,
+    ("GET", "commentThreads"): 1, ("POST", "commentThreads"): 50,
+    ("GET", "comments"): 1, ("POST", "comments"): 50, ("DELETE", "comments"): 50,
+    ("GET", "subscriptions"): 1, ("POST", "subscriptions"): 50, ("DELETE", "subscriptions"): 50,
+    ("GET", "playlists"): 1, ("POST", "playlists"): 50, ("DELETE", "playlists"): 50,
+    ("GET", "playlistItems"): 1, ("POST", "playlistItems"): 50, ("DELETE", "playlistItems"): 50,
+}
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def save_private(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def log(action, target, extra=""):
+    STATE.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{action}\t{target}\t{extra}\n")
+
+
+def spend(units):
+    day = datetime.now(PT).strftime("%Y-%m-%d")
+    q = json.loads(QUOTA.read_text(encoding="utf-8")) if QUOTA.exists() else {}
+    if q.get("date") != day:
+        q = {"date": day, "units": 0}
+    q["units"] += units
+    save_private(QUOTA, q)
+
+
+def client():
+    if not CLIENT.exists():
+        die(f'No {CLIENT}: save the JSON of a Google OAuth client of type "Desktop app" there.')
+    d = json.loads(CLIENT.read_text(encoding="utf-8"))
+    c = d.get("installed") or d.get("web")
+    if not c:
+        die('client_secret.json has no "installed" section: create an OAuth client of type "Desktop app".')
+    return c
+
+
+def post_form(url, fields):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        if "invalid_grant" in body:
+            die("Sign-in expired or was revoked (invalid_grant): run `dextra auth` again. "
+                'If this happens every 7 days, the Google Cloud app is still in "Testing" publishing status.')
+        die(f"Google answered {e.code}: {body}")
+
+
+def access_token():
+    if not TOKEN.exists():
+        die("Not signed in yet: run `dextra auth` first.")
+    t = json.loads(TOKEN.read_text(encoding="utf-8"))
+    if t.get("expires_at", 0) - 60 > time.time():
+        return t["access_token"]
+    c = client()
+    n = post_form(c.get("token_uri", TOKEN_URI), {
+        "client_id": c["client_id"], "client_secret": c.get("client_secret", ""),
+        "refresh_token": t["refresh_token"], "grant_type": "refresh_token"})
+    t["access_token"] = n["access_token"]
+    t["expires_at"] = time.time() + n.get("expires_in", 3600)
+    if n.get("refresh_token"):
+        t["refresh_token"] = n["refresh_token"]
+    save_private(TOKEN, t)
+    return t["access_token"]
+
+
+def api(method, path, params=None, body=None):
+    url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + access_token(), "Accept": "application/json"})
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        spend(1)  # an invalid request still costs at least one unit
+        text = e.read().decode("utf-8", "replace")
+        try:
+            err = json.loads(text)["error"]
+            reason = (err.get("errors") or [{}])[0].get("reason", "")
+            msg = err.get("message", "")
+        except (ValueError, KeyError, TypeError):
+            reason, msg = "", text[:300]
+        if reason == "quotaExceeded":
+            die("The daily quota is used up; it resets at midnight Pacific Time (see `dextra quota`).")
+        die(f"YouTube: {e.code} {reason} — {msg}")
+    spend(COST.get((method, path), 1))
+    return json.loads(raw) if raw else {}
+
+
+def pages(path, params, limit=None):
+    params = dict(params)
+    got = 0
+    while True:
+        r = api("GET", path, params)
+        for item in r.get("items", []):
+            yield item
+            got += 1
+            if limit and got >= limit:
+                return
+        token = r.get("nextPageToken")
+        if not token:
+            return
+        params["pageToken"] = token
+
+
+def video_id(s):
+    s = s.strip()
+    if len(s) == 11 and all(ch.isalnum() or ch in "-_" for ch in s):
+        return s
+    u = urllib.parse.urlparse(s)
+    if (u.hostname or "").endswith("youtu.be"):
+        return u.path.strip("/").split("/")[0]
+    q = urllib.parse.parse_qs(u.query)
+    if "v" in q:
+        return q["v"][0]
+    parts = [p for p in u.path.split("/") if p]
+    if len(parts) >= 2 and parts[0] in ("shorts", "live", "embed"):
+        return parts[1]
+    die(f"Not a video I recognise: {s}")
+
+
+def channel_id(s):
+    s = s.strip()
+    if s.startswith("UC") and len(s) == 24:
+        return s
+    u = urllib.parse.urlparse(s)
+    parts = [urllib.parse.unquote(p) for p in u.path.split("/") if p] if u.scheme else [s]
+    if len(parts) >= 2 and parts[0] == "channel":
+        return parts[1]
+    handle = parts[0] if parts else s
+    if not handle.startswith("@"):
+        handle = "@" + handle
+    items = api("GET", "channels", {"part": "id", "forHandle": handle}).get("items")
+    if not items:
+        die(f"Channel {handle} not found.")
+    return items[0]["id"]
+
+
+def video_title(vid):
+    items = api("GET", "videos", {"part": "snippet", "id": vid}).get("items")
+    return items[0]["snippet"]["title"] if items else vid
+
+
+# --- commands ----------------------------------------------------------------
+
+def cmd_auth(a):
+    c = client()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    got = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" not in q and "error" not in q:
+                self.send_response(404)
+                self.end_headers()
+                return
+            got.update({k: v[0] for k, v in q.items()})
+            ok = "code" in q and q.get("state", [""])[0] == state
+            page = ("<!doctype html><meta charset='utf-8'><title>Dextra</title>"
+                    + ("<h2>Done, you are signed in. You can close this tab.</h2>" if ok
+                       else "<h2>Sign-in failed. Go back to the terminal.</h2>")).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)  # loopback redirect, random port
+    srv.timeout = 1
+    redirect = f"http://127.0.0.1:{srv.server_port}"
+    url = c.get("auth_uri", "https://accounts.google.com/o/oauth2/auth") + "?" + urllib.parse.urlencode({
+        "client_id": c["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "scope": SCOPE, "access_type": "offline", "prompt": "consent",
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": state})
+    print("Opening Google sign-in in the browser. If it does not open, use this link:\n" + url, flush=True)
+    if not a.no_browser:
+        webbrowser.open(url)
+    deadline = time.time() + a.wait
+    while not got and time.time() < deadline:
+        srv.handle_request()
+    srv.server_close()
+    if not got:
+        die(f"No sign-in arrived within {a.wait} seconds.")
+    if "error" in got:
+        die(f"Google returned an error: {got['error']}")
+    if got.get("state") != state:
+        die("State mismatch: the answer was discarded.")
+    t = post_form(c.get("token_uri", TOKEN_URI), {
+        "code": got["code"], "client_id": c["client_id"], "client_secret": c.get("client_secret", ""),
+        "redirect_uri": redirect, "grant_type": "authorization_code", "code_verifier": verifier})
+    if "refresh_token" not in t:
+        die("Google did not issue a refresh token: run `dextra auth` again.")
+    t["expires_at"] = time.time() + t.get("expires_in", 3600)
+    save_private(TOKEN, t)
+    log("auth", "-", t.get("scope", ""))
+    items = api("GET", "channels", {"part": "snippet", "mine": "true"}).get("items")
+    print("Signed in. Channel:", items[0]["snippet"]["title"] if items
+          else "(this account has no channel; ratings, subscriptions and playlists still work)")
+
+
+def cmd_revoke(a):
+    if not TOKEN.exists():
+        print("Not signed in.")
+        return
+    t = json.loads(TOKEN.read_text(encoding="utf-8"))
+    req = urllib.request.Request(REVOKE_URI, data=urllib.parse.urlencode(
+        {"token": t.get("refresh_token") or t.get("access_token", "")}).encode())
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+        print("Access revoked at Google.")
+    except urllib.error.HTTPError as e:
+        print(f"Google answered {e.code} to the revoke request; deleting the local token anyway.")
+    TOKEN.unlink()
+    log("revoke", "-")
+    print("Local token deleted.")
+
+
+def cmd_me(a):
+    items = api("GET", "channels", {"part": "snippet,statistics", "mine": "true"}).get("items")
+    if not items:
+        print("This account has no channel of its own.")
+        return
+    ch = items[0]
+    st = ch.get("statistics", {})
+    print(f"{ch['snippet']['title']}  {ch['id']}  subscribers: {st.get('subscriberCount', '?')}  "
+          f"videos: {st.get('videoCount', '?')}")
+
+
+def cmd_rate(a, rating=None):
+    rating = rating or a.rating
+    vid = video_id(a.video)
+    api("POST", "videos/rate", {"id": vid, "rating": rating})
+    title = video_title(vid)
+    log("rate:" + rating, vid, title)
+    word = {"like": "liked", "dislike": "disliked", "none": "rating removed"}[rating]
+    print(f"Done: {word} — “{title}”")
+
+
+def cmd_rating(a):
+    ids = ",".join(video_id(v) for v in a.videos)
+    for it in api("GET", "videos/getRating", {"id": ids}).get("items", []):
+        print(f"{it['videoId']}\t{it['rating']}")
+
+
+def cmd_comment(a):
+    vid = video_id(a.video)
+    r = api("POST", "commentThreads", {"part": "snippet"}, {"snippet": {
+        "videoId": vid, "topLevelComment": {"snippet": {"textOriginal": a.text}}}})
+    log("comment", vid, a.text.replace("\n", " ")[:200])
+    print(f"Comment posted: https://www.youtube.com/watch?v={vid}&lc={r.get('id', '')}")
+
+
+def cmd_reply(a):
+    r = api("POST", "comments", {"part": "snippet"}, {"snippet": {"parentId": a.parent, "textOriginal": a.text}})
+    log("reply", a.parent, a.text.replace("\n", " ")[:200])
+    print(f"Reply posted, id {r.get('id', '')}")
+
+
+def cmd_comments(a):
+    vid = video_id(a.video)
+    for th in pages("commentThreads", {"part": "snippet", "videoId": vid, "maxResults": 100,
+                                       "order": a.order, "textFormat": "plainText"}, a.limit):
+        top = th["snippet"]["topLevelComment"]["snippet"]
+        text = top["textDisplay"].replace("\n", " ")
+        print(f"[{top.get('likeCount', 0)}♥ {th['snippet'].get('totalReplyCount', 0)}↩] "
+              f"{top['authorDisplayName']}: {text[:300]}  ({th['id']})")
+
+
+def cmd_subs(a):
+    n = 0
+    for s in pages("subscriptions", {"part": "snippet", "mine": "true", "maxResults": 50, "order": "alphabetical"}):
+        print(f"{s['snippet']['resourceId']['channelId']}\t{s['snippet']['title']}")
+        n += 1
+    print(f"— subscriptions: {n}", file=sys.stderr)
+
+
+def cmd_sub(a):
+    cid = channel_id(a.channel)
+    r = api("POST", "subscriptions", {"part": "snippet"}, {"snippet": {
+        "resourceId": {"kind": "youtube#channel", "channelId": cid}}})
+    title = r.get("snippet", {}).get("title", cid)
+    log("subscribe", cid, title)
+    print(f"Subscribed: {title}")
+
+
+def cmd_unsub(a):
+    cid = channel_id(a.channel)
+    items = api("GET", "subscriptions", {"part": "id,snippet", "mine": "true", "forChannelId": cid}).get("items")
+    if not items:
+        print("Not subscribed to this channel.")
+        return
+    api("DELETE", "subscriptions", {"id": items[0]["id"]})
+    title = items[0]["snippet"]["title"]
+    log("unsubscribe", cid, title)
+    print(f"Unsubscribed: {title}")
+
+
+def cmd_playlists(a):
+    for p in pages("playlists", {"part": "snippet,contentDetails,status", "mine": "true", "maxResults": 50}):
+        print(f"{p['id']}\t{p['contentDetails']['itemCount']:>4}\t{p['status']['privacyStatus']:<8}\t"
+              f"{p['snippet']['title']}")
+
+
+def cmd_plnew(a):
+    r = api("POST", "playlists", {"part": "snippet,status"}, {
+        "snippet": {"title": a.title, "description": a.description or ""},
+        "status": {"privacyStatus": a.privacy}})
+    log("playlist:new", r.get("id", ""), a.title)
+    print(f"Playlist created: {a.title}  {r.get('id', '')}")
+
+
+def cmd_pladd(a):
+    vid = video_id(a.video)
+    api("POST", "playlistItems", {"part": "snippet"}, {"snippet": {
+        "playlistId": a.playlist, "resourceId": {"kind": "youtube#video", "videoId": vid}}})
+    title = video_title(vid)
+    log("playlist:add", a.playlist, f"{vid} {title}")
+    print(f"Added to the playlist: “{title}”")
+
+
+def cmd_plitems(a):
+    for it in pages("playlistItems", {"part": "snippet", "playlistId": a.playlist, "maxResults": 50}, a.limit):
+        sn = it["snippet"]
+        print(f"{sn['position']:>4}\t{sn['resourceId'].get('videoId', '')}\t{sn['title']}")
+
+
+def cmd_liked(a):
+    for v in pages("videos", {"part": "snippet", "myRating": "like", "maxResults": 50}, a.limit):
+        print(f"{v['id']}\t{v['snippet']['channelTitle']}\t{v['snippet']['title']}")
+
+
+def cmd_quota(a):
+    now_pt = datetime.now(PT)
+    q = json.loads(QUOTA.read_text(encoding="utf-8")) if QUOTA.exists() else {}
+    used = q.get("units", 0) if q.get("date") == now_pt.strftime("%Y-%m-%d") else 0
+    reset = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
+    print(f"Used today (Dextra's own count): {used} of {DAILY} units; about {(DAILY - used) // 50} "
+          f"write actions left. Resets at {reset:%Y-%m-%d %H:%M} local time.")
+
+
+def cmd_log(a):
+    if not LOG.exists():
+        print("No actions yet.")
+        return
+    for line in LOG.read_text(encoding="utf-8").splitlines()[-a.n:]:
+        print(line)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dextra", description="A right hand on YouTube (YouTube Data API v3).")
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    s = sp.add_parser("auth", help="sign in once (browser, then Allow)")
+    s.add_argument("--no-browser", action="store_true", help="only print the sign-in link")
+    s.add_argument("--wait", type=int, default=600, help="seconds to wait for the sign-in")
+    s.set_defaults(fn=cmd_auth)
+    sp.add_parser("revoke", help="revoke access at Google and delete the local token").set_defaults(fn=cmd_revoke)
+    sp.add_parser("me", help="which channel this sign-in belongs to").set_defaults(fn=cmd_me)
+
+    s = sp.add_parser("rate", help="rate a video: like | dislike | none")
+    s.add_argument("video")
+    s.add_argument("rating", choices=["like", "dislike", "none"])
+    s.set_defaults(fn=cmd_rate)
+    for name, rating, hlp in (("like", "like", "like a video"), ("dislike", "dislike", "dislike a video"),
+                              ("unlike", "none", "remove a rating")):
+        s = sp.add_parser(name, help=hlp)
+        s.add_argument("video")
+        s.set_defaults(fn=lambda a, r=rating: cmd_rate(a, r))
+    s = sp.add_parser("rating", help="show your ratings of videos")
+    s.add_argument("videos", nargs="+")
+    s.set_defaults(fn=cmd_rating)
+
+    s = sp.add_parser("comment", help="post a comment on a video")
+    s.add_argument("video")
+    s.add_argument("text")
+    s.set_defaults(fn=cmd_comment)
+    s = sp.add_parser("reply", help="reply to a comment thread (thread id)")
+    s.add_argument("parent")
+    s.add_argument("text")
+    s.set_defaults(fn=cmd_reply)
+    s = sp.add_parser("comments", help="read the comments of a video")
+    s.add_argument("video")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--order", choices=["relevance", "time"], default="relevance")
+    s.set_defaults(fn=cmd_comments)
+
+    sp.add_parser("subs", help="list your subscriptions").set_defaults(fn=cmd_subs)
+    s = sp.add_parser("sub", help="subscribe (UC… id, @handle or channel link)")
+    s.add_argument("channel")
+    s.set_defaults(fn=cmd_sub)
+    s = sp.add_parser("unsub", help="unsubscribe")
+    s.add_argument("channel")
+    s.set_defaults(fn=cmd_unsub)
+
+    sp.add_parser("playlists", help="list your playlists").set_defaults(fn=cmd_playlists)
+    s = sp.add_parser("pl-new", help="create a playlist")
+    s.add_argument("title")
+    s.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
+    s.add_argument("--description")
+    s.set_defaults(fn=cmd_plnew)
+    s = sp.add_parser("pl-add", help="add a video to a playlist")
+    s.add_argument("playlist")
+    s.add_argument("video")
+    s.set_defaults(fn=cmd_pladd)
+    s = sp.add_parser("pl-items", help="list the videos of a playlist")
+    s.add_argument("playlist")
+    s.add_argument("--limit", type=int)
+    s.set_defaults(fn=cmd_plitems)
+    s = sp.add_parser("liked", help="list your liked videos")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(fn=cmd_liked)
+
+    sp.add_parser("quota", help="today's quota use").set_defaults(fn=cmd_quota)
+    s = sp.add_parser("log", help="log of actions taken on the account")
+    s.add_argument("-n", type=int, default=20)
+    s.set_defaults(fn=cmd_log)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

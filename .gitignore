@@ -1,0 +1,5 @@
+# Secrets never belong in the repository
+client_secret*.json
+token.json
+*.tmp
+__pycache__/
